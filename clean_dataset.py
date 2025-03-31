@@ -4,10 +4,11 @@ import re
 from groq import Groq
 from tqdm import tqdm
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import asyncio
 from collections import deque
 from datetime import datetime, timedelta
+import threading
 
 # Initialize Groq client
 client = Groq(
@@ -18,6 +19,7 @@ client = Groq(
 RPM_LIMIT = 30  # requests per minute
 REQUESTS_WINDOW = deque(maxlen=RPM_LIMIT)
 MIN_REQUEST_INTERVAL = 60 / RPM_LIMIT  # minimum seconds between requests
+rate_limit_lock = threading.Lock()  # Thread-safe lock for rate limiting
 
 class CheckpointManager:
     def __init__(self, checkpoint_file):
@@ -55,21 +57,22 @@ def extract_type_from_text(text):
     return "unknown"
 
 def wait_for_rate_limit():
-    """Ensure we don't exceed rate limits"""
-    now = datetime.now()
-    
-    # Remove old requests from window
-    while REQUESTS_WINDOW and (now - REQUESTS_WINDOW[0]).total_seconds() > 60:
-        REQUESTS_WINDOW.popleft()
-    
-    # If window is full, wait until we can make another request
-    if len(REQUESTS_WINDOW) >= RPM_LIMIT:
-        wait_time = 60 - (now - REQUESTS_WINDOW[0]).total_seconds()
-        if wait_time > 0:
-            time.sleep(wait_time)
-    
-    # Add current request to window
-    REQUESTS_WINDOW.append(now)
+    """Ensure we don't exceed rate limits - thread-safe version"""
+    with rate_limit_lock:
+        now = datetime.now()
+        
+        # Remove old requests from window
+        while REQUESTS_WINDOW and (now - REQUESTS_WINDOW[0]).total_seconds() > 60:
+            REQUESTS_WINDOW.popleft()
+        
+        # If window is full, wait until we can make another request
+        if len(REQUESTS_WINDOW) >= RPM_LIMIT:
+            wait_time = 60 - (now - REQUESTS_WINDOW[0]).total_seconds()
+            if wait_time > 0:
+                time.sleep(wait_time)
+        
+        # Add current request to window
+        REQUESTS_WINDOW.append(now)
 
 def clean_entry(entry):
     """Clean a single entry using Groq API"""
@@ -93,6 +96,15 @@ def clean_entry(entry):
 
     workout_data, analysis = parts
 
+    # Check if analysis has both sections
+    if "Reasoning:" not in analysis or "Recommendation:" not in analysis:
+        print("Missing required sections - attempting to fix")
+        # Try to fix by adding missing sections
+        if "Reasoning:" not in analysis:
+            analysis = "Reasoning: " + analysis
+        if "Recommendation:" not in analysis:
+            analysis = analysis + "\n\nRecommendation: Complete the recommendation based on the reasoning above."
+
     prompt = f"""Clean and improve this fitness recommendation while maintaining the exact same format. Focus on:
 1. Remove any Chinese characters
 2. Fix cut-off recommendations
@@ -100,23 +112,26 @@ def clean_entry(entry):
 4. Make recommendations and reasoning fitness-focused and evidence-based
 5. Ensure recommendations are safe and appropriate
 6. Use proper fitness terminology
+7. Keep reasoning focused and evidence-based (2-3 key points)
+8. Make recommendations concise and actionable (2-3 specific steps)
 
 For {entry_type} entries, keep this exact structure:
 {workout_data}
 
-The reasoning and recommendation should be clear and concise, focusing on:
-- Evidence-based fitness principles
-- Safe and effective exercise modifications
-- Clear progression paths
-- Practical implementation advice
+The reasoning and recommendation should be clear and focused, emphasizing:
+- Key biomechanical or physiological principles
+- Most important form considerations
+- Primary safety concerns
+- Essential modifications
+- Core progression steps
 
 Original analysis to clean:
 {analysis}
 
 Return the complete entry maintaining the exact format with:
 1. The 'Workout Data:' section unchanged
-2. A 'Reasoning:' section explaining the analysis
-3. A 'Recommendation:' section with specific, actionable advice
+2. A 'Reasoning:' section with focused, evidence-based analysis (2-3 key points)
+3. A 'Recommendation:' section with clear, actionable steps (2-3 specific recommendations)
 
 Make sure to include both 'Reasoning:' and 'Recommendation:' headers in your response."""
 
@@ -132,8 +147,9 @@ Make sure to include both 'Reasoning:' and 'Recommendation:' headers in your res
                     "content": f"""You are a fitness expert that improves workout recommendations. For {entry_type} entries, keep the exact same format and structure. 
                     Your response must include:
                     1. The original Workout Data section unchanged
-                    2. A Reasoning section with the header "Reasoning:"
-                    3. A Recommendation section with the header "Recommendation:"
+                    2. A Reasoning section with the header "Reasoning:" providing focused, evidence-based analysis (2-3 key points)
+                    3. A Recommendation section with the header "Recommendation:" giving clear, actionable steps (2-3 specific recommendations)
+                    Keep reasoning focused on key principles and recommendations concise but comprehensive.
                     Only clean up the reasoning and recommendation content."""
                 },
                 {
@@ -142,7 +158,7 @@ Make sure to include both 'Reasoning:' and 'Recommendation:' headers in your res
                 }
             ],
             temperature=0.1,
-            max_tokens=1000
+            max_tokens=4000  # Keep high token limit but encourage focused responses
         )
         
         cleaned_text = completion.choices[0].message.content.strip()
@@ -170,15 +186,26 @@ Make sure to include both 'Reasoning:' and 'Recommendation:' headers in your res
         return entry
 
 def process_batch(entries, output_file, stats):
-    """Process a batch of entries"""
+    """Process a batch of entries in parallel"""
     results = []
-    for entry in entries:
-        cleaned_entry = clean_entry(entry)
-        if cleaned_entry == entry:
-            stats["failure"] += 1
-        else:
-            stats["success"] += 1
-        results.append(cleaned_entry)
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        # Submit all tasks to the executor
+        future_to_entry = {executor.submit(clean_entry, entry): entry for entry in entries}
+        
+        # Process completed tasks as they finish
+        for future in as_completed(future_to_entry):
+            entry = future_to_entry[future]
+            try:
+                cleaned_entry = future.result()
+                if cleaned_entry == entry:
+                    stats["failure"] += 1
+                else:
+                    stats["success"] += 1
+                results.append(cleaned_entry)
+            except Exception as e:
+                print(f"Error processing entry: {str(e)}")
+                stats["failure"] += 1
+                results.append(entry)
     
     # Write batch results to file
     with open(output_file, 'a') as outfile:
@@ -189,7 +216,7 @@ def main():
     input_file = "fitness_workout_dataset.jsonl"
     output_file = "fitness_workout_dataset_cleaned.jsonl"
     checkpoint_file = "cleaning_checkpoint.json"
-    batch_size = 10  # Process 10 entries at a time
+    batch_size = 20  # Increased batch size for parallel processing
     
     # Initialize checkpoint manager
     checkpoint_mgr = CheckpointManager(checkpoint_file)
@@ -201,6 +228,7 @@ def main():
     
     remaining_lines = total_lines - start_line
     print(f"Processing {remaining_lines} remaining entries starting from line {start_line}...")
+    print(f"Using parallel processing with 5 workers and batch size of {batch_size}")
     
     # Keep track of success/failure stats
     stats = {"success": 0, "failure": 0}
